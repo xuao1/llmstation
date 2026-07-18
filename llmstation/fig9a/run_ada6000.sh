@@ -19,7 +19,7 @@ forward_wait=$4
 backward_tasklets=$5
 backward_wait=$6
 
-benchmark_duration=240
+benchmark_duration=600
 
 num_prompts=$(awk \
     -v rate="$request_rate" \
@@ -30,8 +30,8 @@ num_prompts=$(awk \
         print n;
     }')
 
-vllm_server_log=fig8a_vllm_server.log
-vllm_client_log=fig8a_vllm_client.log
+vllm_server_log=fig9a_vllm_server.log
+vllm_client_log=fig9a_vllm_client.log
 lms_output_dir=$PWD
 
 get_val() {
@@ -41,7 +41,7 @@ lora_adapter="ETH-LLMSys/Meta-Llama-3.1-8B-LoRA"
 lora_path=$(get_val $lora_adapter)
 rm -rf *.log
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=2
 export CUDA_MPS_PIPE_DIRECTORY=./nvidia-mps
 export CUDA_MPS_LOG_DIRECTORY=./nvidia-log
 nvidia-cuda-mps-control -d
@@ -70,7 +70,7 @@ sleep $init_secs
 start_line=$(wc -l < "${lms_output_dir}/lms.log")
 burstgpt_trace="$download_dir/BurstGPT_half.csv"
 
-python ../../python/benchmark_serving.py \
+python ../../python/benchmark_serving_burst.py \
         --backend vllm --model /workspace/model/Meta-Llama-3-8B-Instruct \
         --dataset-name burstgpt --dataset-path "$burstgpt_trace" \
 		--burstgpt-max-model-len 8192 --ignore-eos \
