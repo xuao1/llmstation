@@ -2162,14 +2162,14 @@ def finetune(
         cache_dir = cache_dir,
     )
     dataset = dataset.map(
-        lambda sample_raw: prepare_alpaca(sample_raw, tokenizer, 500),
+        lambda sample_raw: prepare_alpaca(sample_raw, tokenizer, 256),
         remove_columns=dataset["train"].column_names,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset["train"],
         shuffle=False,
         collate_fn=DataCollatorForLanguageModeling(tokenizer, mlm=False),
-        batch_size=1,
+        batch_size=2,
         pin_memory=False,
     )
     dataloader_iter = itertools.cycle(iter(dataloader))
@@ -2327,7 +2327,7 @@ def finetune(
         forward_time += start_event.elapsed_time(end_forward_event) / 1e3
         finetune_time += start_event.elapsed_time(end_event) / 1e3
 
-        consumed_finetune_samples += 1
+        consumed_finetune_samples += input_ids.size(0)
         if rank == 0 and finetune_time > 10.0:
             import os
             lms_log = lms_output + '/lms.log'

@@ -22,15 +22,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
-from typing import Iterable, List, Optional, Tuple, Union
+import math
+from typing import Generator, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import Qwen2Config
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (differentiable_all_gather,
+                              differentiable_all_reduce_sum,
+                              differentiable_identity, get_pp_group,
+                              get_tensor_model_parallel_world_size)
+from vllm.lora.layers import MergedQKVParallelLinearWithLora
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
@@ -256,6 +262,10 @@ class Qwen2Model(nn.Module):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        # LLMStation only uses tensor parallelism and deep-copies the model
+        # before starting its fine-tuning workers. The local factory function
+        # cannot be serialized across those process boundaries.
+        self.make_empty_intermediate_tensors = None
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -403,6 +413,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.sampler = Sampler()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        self.make_empty_intermediate_tensors = None
 
     def forward(
         self,
@@ -440,3 +451,219 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                            if self.config.tie_word_embeddings else None),
         )
         loader.load_weights(weights)
+
+    def add_lora_train(self, device: torch.device) -> None:
+        """Add the trainable Q/K/V LoRA weights used by LLMStation."""
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        for module in self.modules():
+            if not isinstance(module, MergedQKVParallelLinearWithLora):
+                continue
+
+            # Match the initialization and scaling used by the Llama LMS
+            # path. Resetting the seed also keeps all TP workers in sync.
+            torch.manual_seed(0)
+            rank = module.lora_config.max_lora_rank
+            module.lora_a_train_q_proj = nn.Parameter(
+                torch.empty(rank, module.input_size, device=device))
+            nn.init.kaiming_uniform_(module.lora_a_train_q_proj,
+                                     a=math.sqrt(5))
+            module.lora_b_train_q_proj = nn.Parameter(
+                torch.zeros(module.q_proj_shard_size, rank, device=device))
+
+            module.lora_a_train_k_proj = nn.Parameter(
+                torch.empty(rank, module.input_size, device=device))
+            nn.init.kaiming_uniform_(module.lora_a_train_k_proj,
+                                     a=math.sqrt(5))
+            module.lora_b_train_k_proj = nn.Parameter(
+                torch.zeros(module.kv_proj_shard_size, rank, device=device))
+
+            module.lora_a_train_v_proj = nn.Parameter(
+                torch.empty(rank, module.input_size, device=device))
+            nn.init.kaiming_uniform_(module.lora_a_train_v_proj,
+                                     a=math.sqrt(5))
+            module.lora_b_train_v_proj = nn.Parameter(
+                torch.zeros(module.kv_proj_shard_size, rank, device=device))
+
+    def _unfused_qkv_projection(
+        self,
+        hidden_states: torch.Tensor,
+        lora_layer: MergedQKVParallelLinearWithLora,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run Qwen2's biased Q/K/V projections with trainable LoRA."""
+        q_size = lora_layer.q_proj_shard_size
+        kv_size = lora_layer.kv_proj_shard_size
+        q_weight, k_weight, v_weight = lora_layer.base_layer.weight.split(
+            (q_size, kv_size, kv_size), dim=0)
+
+        bias = lora_layer.base_layer.bias
+        if bias is None:
+            q_bias = k_bias = v_bias = None
+        else:
+            q_bias, k_bias, v_bias = bias.split((q_size, kv_size, kv_size),
+                                                dim=0)
+
+        query_states = F.linear(hidden_states, q_weight, q_bias)
+        key_states = F.linear(hidden_states, k_weight, k_bias)
+        value_states = F.linear(hidden_states, v_weight, v_bias)
+
+        scaling = 32 / lora_layer.lora_config.max_lora_rank
+        projections = (
+            (query_states, lora_layer.lora_a_train_q_proj,
+             lora_layer.lora_b_train_q_proj),
+            (key_states, lora_layer.lora_a_train_k_proj,
+             lora_layer.lora_b_train_k_proj),
+            (value_states, lora_layer.lora_a_train_v_proj,
+             lora_layer.lora_b_train_v_proj),
+        )
+        outputs = []
+        for base_output, lora_a, lora_b in projections:
+            after_a = F.linear(hidden_states.to(lora_a.dtype), lora_a)
+            lora_output = F.linear(after_a, lora_b) * scaling
+            outputs.append((base_output + lora_output).to(base_output.dtype))
+
+        return outputs[0], outputs[1], outputs[2]
+
+    @staticmethod
+    def _repeat_kv(hidden_states: torch.Tensor,
+                   num_repeats: int) -> torch.Tensor:
+        if num_repeats == 1:
+            return hidden_states
+        batch_size, num_kv_heads, seq_len, head_dim = hidden_states.shape
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch_size, num_kv_heads, num_repeats, seq_len, head_dim)
+        return hidden_states.reshape(batch_size,
+                                     num_kv_heads * num_repeats, seq_len,
+                                     head_dim)
+
+    def unfused_forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Generator[Union[torch.Tensor, IntermediateTensors], None, None]:
+        """Run a differentiable Qwen2 forward pass one layer at a time."""
+        if not get_pp_group().is_first_rank:
+            raise NotImplementedError(
+                "Qwen2 LMS fine-tuning does not support pipeline parallelism")
+
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            # Unlike Llama, Qwen2 does not expose embedding LoRA modules, so
+            # this layer is not wrapped and has no ``base_layer`` attribute.
+            hidden_states = self.model.embed_tokens(input_ids)
+
+        batch_size, seq_len = input_ids.shape
+        if positions is None:
+            positions = torch.arange(seq_len,
+                                     dtype=torch.long,
+                                     device=input_ids.device)
+            positions = positions.unsqueeze(0).expand(batch_size, -1)
+        elif positions.dim() == 1:
+            positions = positions.unsqueeze(0).expand(batch_size, -1)
+
+        from transformers.modeling_attn_mask_utils import (
+            _prepare_4d_causal_attention_mask)
+        causal_mask = _prepare_4d_causal_attention_mask(
+            attention_mask=attention_mask,
+            input_shape=(batch_size, seq_len),
+            inputs_embeds=hidden_states,
+            past_key_values_length=0,
+        )
+
+        for layer_idx in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_idx]
+
+            residual = hidden_states
+            hidden_states = layer.input_layernorm.forward_native(
+                hidden_states)
+            hidden_states = differentiable_identity(hidden_states)
+
+            query_states, key_states, value_states = (
+                self._unfused_qkv_projection(hidden_states,
+                                             layer.self_attn.qkv_proj))
+            rotary_emb = getattr(layer.self_attn.rotary_emb, "base_layer",
+                                 layer.self_attn.rotary_emb)
+            query_states, key_states = rotary_emb.forward_native(
+                positions, query_states, key_states)
+
+            query_states = query_states.view(
+                batch_size, seq_len, layer.self_attn.num_heads,
+                layer.self_attn.head_dim).transpose(1, 2)
+            key_states = key_states.view(
+                batch_size, seq_len, layer.self_attn.num_kv_heads,
+                layer.self_attn.head_dim).transpose(1, 2)
+            value_states = value_states.view(
+                batch_size, seq_len, layer.self_attn.num_kv_heads,
+                layer.self_attn.head_dim).transpose(1, 2)
+
+            num_kv_groups = (layer.self_attn.num_heads //
+                             layer.self_attn.num_kv_heads)
+            key_states = self._repeat_kv(key_states, num_kv_groups)
+            value_states = self._repeat_kv(value_states, num_kv_groups)
+
+            attn_weights = (
+                torch.matmul(query_states, key_states.transpose(2, 3)) *
+                layer.self_attn.scaling)
+            if causal_mask is not None:
+                attn_weights = (
+                    attn_weights +
+                    causal_mask[:, :, :, :key_states.shape[-2]])
+            attn_weights = F.softmax(attn_weights,
+                                     dim=-1,
+                                     dtype=torch.float32).to(
+                                         query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+            expected_shape = (batch_size, layer.self_attn.num_heads, seq_len,
+                              layer.self_attn.head_dim)
+            if attn_output.shape != expected_shape:
+                raise ValueError("Attention output has shape "
+                                 f"{tuple(attn_output.shape)}; expected "
+                                 f"{expected_shape}")
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(
+                batch_size, seq_len, -1)
+
+            hidden_states = (
+                layer.self_attn.o_proj.base_layer.quant_method.apply(
+                    layer.self_attn.o_proj.base_layer, attn_output))
+            hidden_states = differentiable_all_reduce_sum(hidden_states)
+            hidden_states = residual + hidden_states
+
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm.forward_native(
+                hidden_states)
+            hidden_states = differentiable_identity(hidden_states)
+
+            partition_size = (
+                layer.mlp.gate_up_proj.base_layer.output_partition_sizes[0])
+            gate_states = F.linear(
+                hidden_states,
+                layer.mlp.gate_up_proj.base_layer.weight[:partition_size])
+            up_states = F.linear(
+                hidden_states,
+                layer.mlp.gate_up_proj.base_layer.weight[partition_size:])
+            hidden_states = F.silu(gate_states) * up_states
+            hidden_states = layer.mlp.down_proj.base_layer.quant_method.apply(
+                layer.mlp.down_proj.base_layer, hidden_states)
+            hidden_states = differentiable_all_reduce_sum(hidden_states)
+            hidden_states = residual + hidden_states
+
+            # Each layer is one forward tasklet and therefore a preemption
+            # point for inference work.
+            yield
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual,
+            })
+
+        hidden_states = self.model.norm.forward_native(hidden_states)
+        logits = F.linear(hidden_states, self.lm_head.weight).float()
+        if self.lm_head.tp_size > 1:
+            logits = differentiable_all_gather(logits)
+        logits = logits[:, :, :self.model.config.vocab_size]
+        yield logits
