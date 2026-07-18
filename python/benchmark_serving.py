@@ -21,10 +21,22 @@ On the client side, run:
     when using tgi backend, add
         --endpoint /generate_stream
     to the end of the command above.
+
+    To replay BurstGPT request lengths (timestamps are ignored), run:
+    python benchmarks/benchmark_serving.py \
+        --backend vllm \
+        --model <your_model> \
+        --dataset-name burstgpt \
+        --dataset-path <BurstGPT_csv> \
+        --request-rate 0.75 \
+        --num-prompts 1000 \
+        --burstgpt-max-model-len <server_context_len> \
+        --ignore-eos
 """
 import argparse
 import asyncio
 import base64
+import csv
 import io
 import json
 import os
@@ -290,6 +302,45 @@ def sample_random_requests(
     return input_requests
 
 
+def sample_burstgpt_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    max_model_len: Optional[int] = None,
+) -> List[Tuple[str, int, int, None]]:
+    """Read BurstGPT lengths and fill each prompt with random tokens."""
+    if not dataset_path:
+        raise ValueError(
+            "--dataset-path is required when --dataset-name=burstgpt.")
+
+    input_requests = []
+    with open(dataset_path, encoding="utf-8-sig", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        required_columns = {"ContextTokens", "GeneratedTokens"}
+        if not required_columns.issubset(reader.fieldnames or []):
+            raise ValueError(
+                "BurstGPT CSV must contain ContextTokens and GeneratedTokens.")
+
+        for row in reader:
+            input_len = int(float(row["ContextTokens"]))
+            output_len = int(float(row["GeneratedTokens"]))
+            if (max_model_len is not None
+                    and input_len + output_len > max_model_len):
+                continue
+
+            prompt_token_ids = np.random.randint(
+                0, tokenizer.vocab_size, size=input_len).tolist()
+            prompt = tokenizer.decode(prompt_token_ids)
+            input_requests.append((prompt, input_len, output_len, None))
+
+            if len(input_requests) == num_requests:
+                break
+
+    if not input_requests:
+        raise ValueError("No usable requests found in the BurstGPT CSV.")
+    return input_requests
+
+
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -487,6 +538,31 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    print("========== Per-decode latency ==========")
+
+    for request_id, output in enumerate(outputs):
+        if not output.success:
+            print(
+                f"DECODE_LATENCY request_id={request_id} failed=true",
+                flush=True,
+            )
+            continue
+
+        print(
+            f"REQUEST_TTFT request_id={request_id} "
+            f"latency_ms={output.ttft * 1000:.3f}",
+            flush=True,
+        )
+
+        for decode_step, latency_s in enumerate(output.itl, start=1):
+            print(
+                f"DECODE_LATENCY "
+                f"request_id={request_id} "
+                f"decode_step={decode_step} "
+                f"latency_ms={latency_s * 1000:.3f}",
+                flush=True,
+            )
+
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
@@ -518,6 +594,8 @@ async def benchmark(
         "request_throughput": metrics.request_throughput,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
+        "requested_input_lens": [request[1] for request in input_requests],
+        "requested_output_lens": [request[2] for request in input_requests],
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -659,6 +737,21 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
         )
 
+    elif args.dataset_name == "burstgpt":
+        input_requests = sample_burstgpt_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            max_model_len=args.burstgpt_max_model_len,
+        )
+        if not args.ignore_eos:
+            warnings.warn(
+                "BurstGPT output lengths are sent as max_tokens. Add "
+                "--ignore-eos to force every successful request to generate "
+                "the full requested number of tokens.",
+                stacklevel=2,
+            )
+
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -758,14 +851,15 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "sonnet", "random", "hf", "burstgpt"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
                         type=str,
                         default=None,
-                        help="Path to the sharegpt/sonnet dataset. "
-                        "Or the huggingface dataset ID if using HF dataset.")
+                        help="Path to the ShareGPT, sonnet, or BurstGPT "
+                        "dataset. Or the Hugging Face dataset ID when using "
+                        "the HF dataset.")
     parser.add_argument(
         "--model",
         type=str,
@@ -942,6 +1036,15 @@ if __name__ == "__main__":
         " context. The length range of context in a random "
         " request is [random-prefix-len, "
         " random-prefix-len + random-prefix-len * random-range-ratio).")
+
+    burstgpt_group = parser.add_argument_group("BurstGPT dataset options")
+    burstgpt_group.add_argument(
+        "--burstgpt-max-model-len",
+        type=int,
+        default=None,
+        help="Skip rows whose input plus output tokens exceed this value. "
+        "By default no client-side context-length filtering is applied.",
+    )
 
     hf_group = parser.add_argument_group("hf dataset options")
     hf_group.add_argument("--hf-subset",
