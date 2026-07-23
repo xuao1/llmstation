@@ -21,7 +21,7 @@ forward_tasklets=$3
 forward_wait=$4
 backward_tasklets=$5
 backward_wait=$6
-qwen_model=${7:-${QWEN_MODEL:-/workspace/model/Qwen2.5-14B-Instruct}}
+qwen_model=${7:-${QWEN_MODEL:-/root/autodl-tmp/Qwen2.5-14B-Instruct}}
 gpu_id=${GPU_ID:-0}
 max_model_len=${MAX_MODEL_LEN:-8192}
 
@@ -75,7 +75,7 @@ nohup vllm serve "$qwen_model" \
 vllm_pid=$!
 echo "vLLM runs in process ${vllm_pid} on GPU ${gpu_id}."
 
-init_secs=${INIT_SECS:-180}
+init_secs=${INIT_SECS:-120}
 echo "Wait $init_secs seconds for vLLM initialization before benchmarking."
 sleep "$init_secs"
 

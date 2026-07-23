@@ -21,7 +21,7 @@ forward_tasklets=$3
 forward_wait=$4
 backward_tasklets=$5
 backward_wait=$6
-llama_model=${7:-${LLAMA_MODEL:-/workspace/model/Llama-2-13b-chat-ms}}
+llama_model=${7:-${LLAMA_MODEL:-/root/autodl-tmp/Llama-2-13b-chat-ms/}}
 gpu_id=${GPU_ID:-0}
 max_model_len=${MAX_MODEL_LEN:-4096}
 
@@ -75,7 +75,7 @@ nohup vllm serve "$llama_model" \
 vllm_pid=$!
 echo "vLLM runs in process ${vllm_pid} on GPU ${gpu_id}."
 
-init_secs=${INIT_SECS:-180}
+init_secs=${INIT_SECS:-120}
 echo "Wait $init_secs seconds for vLLM initialization before benchmarking."
 sleep "$init_secs"
 
