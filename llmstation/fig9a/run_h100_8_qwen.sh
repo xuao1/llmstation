@@ -21,11 +21,11 @@ forward_tasklets=$3
 forward_wait=$4
 backward_tasklets=$5
 backward_wait=$6
-qwen_model=${7:-${QWEN_MODEL:-/home/nebius-l40/scratch/Qwen2.5-72B-Instruct}}
-gpu_ids=${GPU_IDS:-0,1,2,3,4,5,6,7}
+qwen_model=${7:-${QWEN_MODEL:-/root/scratch/Qwen2.5-72B-Instruct}}
+gpu_ids=${GPU_IDS:-0,1,2,3}
 max_model_len=${MAX_MODEL_LEN:-8192}
 
-benchmark_duration=600
+benchmark_duration=240
 num_prompts=$(awk \
     -v rate="$request_rate" \
     -v duration="$benchmark_duration" \
@@ -35,8 +35,8 @@ num_prompts=$(awk \
         print n;
     }')
 
-vllm_server_log=fig9a_h100_8_qwen_vllm_server.log
-vllm_client_log=fig9a_h100_8_qwen_vllm_client.log
+vllm_server_log=fig9a_h100_4_qwen_vllm_server.log
+vllm_client_log=fig9a_h100_4_qwen_vllm_client.log
 lms_output_dir=$PWD
 lms_log="${lms_output_dir}/lms.log"
 vllm_pid=""
@@ -62,9 +62,9 @@ mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 nvidia-cuda-mps-control -d
 
 nohup vllm serve "$qwen_model" \
-    -tp=8 --download_dir "$download_dir" \
+    -tp=4 --download_dir "$download_dir" \
     --disable-async-output-proc --disable-log-requests \
-    --max-model-len="$max_model_len" --gpu-memory-utilization=0.75 \
+    --max-model-len="$max_model_len" --gpu-memory-utilization=0.6 \
     --enable-lora --max-loras 4 --max-lora-rank=8 \
     --enable-lms --lms-output="$lms_output_dir" \
     --lms-forward-tasklets "$forward_tasklets" \
@@ -75,7 +75,7 @@ nohup vllm serve "$qwen_model" \
 vllm_pid=$!
 echo "vLLM runs in process ${vllm_pid} on GPUs ${gpu_ids}."
 
-init_secs=${INIT_SECS:-180}
+init_secs=${INIT_SECS:-360}
 echo "Wait $init_secs seconds for vLLM initialization before benchmarking."
 sleep "$init_secs"
 
