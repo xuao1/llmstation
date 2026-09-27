@@ -16,8 +16,8 @@
 """Qwen3 MoE inference and layer-wise Q/K/V LoRA training for LLMStation.
 
 The inference path uses packed, tensor-parallel experts. The training path
-uses the same frozen weights with native PyTorch operations so gradients can
-flow through both the selected experts and their routing probabilities.
+uses the same frozen weights with native PyTorch operations or optional Triton
+grouped GEMMs. Both propagate gradients through experts and routing probabilities.
 """
 from typing import Generator, Iterable, Optional, Tuple
 
@@ -26,12 +26,14 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import (differentiable_all_reduce_sum,
                               differentiable_identity, get_pp_group,
                               get_tensor_model_parallel_world_size,
                               get_tp_group)
+from vllm.logger import init_logger
 from vllm.lora.layers import MergedQKVParallelLinearWithLora
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -50,6 +52,8 @@ from vllm.sequence import IntermediateTensors
 
 from .qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2MLP, Qwen2Model
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
+
+logger = init_logger(__name__)
 
 
 class _GatherTrainingLogits(torch.autograd.Function):
@@ -111,6 +115,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.quant_config = quant_config
+        # Capture the choice on construction so it survives LMS deepcopy and
+        # process transfer along with the packed expert parameters.
+        self.use_grouped_gemm = envs.VLLM_LMS_QWEN3_MOE_GROUPED_GEMM
         tp_size = get_tensor_model_parallel_world_size()
         if config.hidden_act != "silu":
             raise ValueError("Qwen3 MoE only supports the silu activation")
@@ -159,20 +166,28 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        output = torch.zeros_like(hidden_states)
-        for expert_idx in range(self.num_experts):
-            token_idx, slot_idx = torch.where(selected_experts == expert_idx)
-            if token_idx.numel() == 0:
-                continue
-            expert_input = hidden_states[token_idx]
-            gate, up = F.linear(
-                expert_input,
-                self.experts.w13_weight[expert_idx]).chunk(2, dim=-1)
-            expert_output = F.linear(F.silu(gate) * up,
-                                      self.experts.w2_weight[expert_idx])
-            expert_output = expert_output * routing_weights[token_idx,
-                                                             slot_idx, None]
-            output.index_add_(0, token_idx, expert_output)
+        if self.use_grouped_gemm:
+            from vllm.model_executor.layers.fused_moe.grouped_gemm import (
+                grouped_moe)
+
+            output = grouped_moe(hidden_states, self.experts.w13_weight,
+                                 self.experts.w2_weight, selected_experts,
+                                 routing_weights)
+        else:
+            output = torch.zeros_like(hidden_states)
+            for expert_idx in range(self.num_experts):
+                token_idx, slot_idx = torch.where(selected_experts == expert_idx)
+                if token_idx.numel() == 0:
+                    continue
+                expert_input = hidden_states[token_idx]
+                gate, up = F.linear(
+                    expert_input,
+                    self.experts.w13_weight[expert_idx]).chunk(2, dim=-1)
+                expert_output = F.linear(F.silu(gate) * up,
+                                        self.experts.w2_weight[expert_idx])
+                expert_output = expert_output * routing_weights[token_idx,
+                                                               slot_idx, None]
+                output.index_add_(0, token_idx, expert_output)
 
         # Each rank holds an intermediate-dimension shard of every expert.
         # Input gradients are reduced by the caller's differentiable_identity.
@@ -433,6 +448,12 @@ class Qwen3MoeForCausalLM(Qwen2ForCausalLM):
                 raise ValueError("Enable LoRA before starting Qwen3 MoE LMS "
                                  "fine-tuning")
         super().add_lora_train(device)
+        grouped = any(
+            isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
+            and layer.mlp.use_grouped_gemm for layer in self.model.layers)
+        logger.info("Qwen3 MoE LMS expert GEMM backend: %s; training Q/K/V "
+                    "LoRA with frozen experts and router.",
+                    "grouped (Triton)" if grouped else "per-expert (PyTorch)")
         self.train()
 
     def _unfused_qkv_projection(

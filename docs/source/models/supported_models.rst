@@ -283,6 +283,30 @@ Text Generation
     weights and does not support pipeline parallelism. Sliding-window attention
     is not supported.
 
+    Set ``VLLM_LMS_QWEN3_MOE_GROUPED_GEMM=1`` before launching the server to
+    enable Triton grouped GEMMs for Qwen3MoE fine-tuning. The default is ``0``
+    (the per-expert PyTorch implementation). Grouped GEMMs batch the selected
+    experts in both the forward pass and input-gradient backward pass, using
+    the existing tensor-parallel weight shards. Routing probabilities remain
+    differentiable; expert and router weights remain frozen, and only Q/K/V
+    LoRA adapters are trained. This option supports unquantized CUDA FP16,
+    BF16 and FP32 weights. It does not change the serving FusedMoE path. The
+    training initialization log reports the selected expert GEMM backend.
+    Grouping changes the number and duration of backward autograd tasklets;
+    recheck the ``--lms-backward-tasklets`` setting when comparing mixed
+    inference/fine-tuning latency. The first use compiles Triton kernels.
+
+    A standalone benchmark compares forward and forward-plus-backward time
+    with synthetic Qwen3-30B-A3B expert weights:
+
+    .. code-block:: bash
+
+        python benchmarks/kernels/benchmark_grouped_moe.py --tp-size 4
+
+    This measures one TP shard on one GPU, including routing and CPU dispatch
+    overhead but excluding TP communication and the rest of the model. Use
+    ``--tp-size 2`` for the intermediate-dimension shard used on two H100s.
+
 Text Embedding
 --------------
 

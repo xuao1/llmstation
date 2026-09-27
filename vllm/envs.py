@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS: bool = False
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 64 * 1024
+    VLLM_LMS_QWEN3_MOE_GROUPED_GEMM: bool = False
     VLLM_USE_RAY_SPMD_WORKER: bool = False
     VLLM_USE_RAY_COMPILED_DAG: bool = False
     VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL: bool = True
@@ -363,6 +364,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
         )),
     "VLLM_FUSED_MOE_CHUNK_SIZE":
     lambda: int(os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", "32768")),
+
+    # Use differentiable grouped expert GEMMs for Qwen3 MoE LMS fine-tuning.
+    # Serving still uses FusedMoE. Expert weights must remain frozen.
+    "VLLM_LMS_QWEN3_MOE_GROUPED_GEMM":
+    lambda: bool(int(os.getenv("VLLM_LMS_QWEN3_MOE_GROUPED_GEMM", "0"))),
 
     # If set, vllm will skip the deprecation warnings.
     "VLLM_NO_DEPRECATION_WARNING":

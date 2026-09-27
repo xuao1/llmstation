@@ -242,6 +242,8 @@ class RayGPUExecutor(DistributedGPUExecutor):
             VLLM_INSTANCE_ID,
             "VLLM_TRACE_FUNCTION":
             str(envs.VLLM_TRACE_FUNCTION),
+            "VLLM_LMS_QWEN3_MOE_GROUPED_GEMM":
+            str(int(envs.VLLM_LMS_QWEN3_MOE_GROUPED_GEMM)),
             **({
                 "VLLM_ATTENTION_BACKEND": envs.VLLM_ATTENTION_BACKEND
             } if envs.VLLM_ATTENTION_BACKEND is not None else {})

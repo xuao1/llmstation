@@ -194,9 +194,14 @@ def dense_moe_reference(block, inputs, config):
 
 
 @pytest.mark.parametrize("normalize", [False, True])
-def test_moe_outputs_and_input_gradients(single_gpu, normalize):
+@pytest.mark.parametrize("grouped_gemm", [False, True])
+def test_moe_outputs_and_input_gradients(single_gpu, monkeypatch, normalize,
+                                         grouped_gemm):
+    monkeypatch.setenv("VLLM_LMS_QWEN3_MOE_GROUPED_GEMM",
+                       "1" if grouped_gemm else "0")
     config = tiny_config(norm_topk_prob=normalize)
     block = Qwen3MoeSparseMoeBlock(config)
+    assert block.use_grouped_gemm == grouped_gemm
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.normal_(mean=0, std=0.05)
@@ -237,7 +242,11 @@ class ReferenceLoRA(nn.Module):
             F.linear(inputs, self.lora_a), self.lora_b) * self.scaling
 
 
-def test_unfused_hf_logits_lora_gradients_and_tasklets(single_gpu):
+@pytest.mark.parametrize("grouped_gemm", [False, True])
+def test_unfused_hf_logits_lora_gradients_and_tasklets(single_gpu, monkeypatch,
+                                                     grouped_gemm):
+    monkeypatch.setenv("VLLM_LMS_QWEN3_MOE_GROUPED_GEMM",
+                       "1" if grouped_gemm else "0")
     hf_module = pytest.importorskip(
         "transformers.models.qwen3_moe.modeling_qwen3_moe")
     # Include a dense layer as well as MoE, grouped-query attention, and an
@@ -319,6 +328,8 @@ def tp_qkv_worker(tp_size, pp_size, rank, distributed_init_port):
         for num_kv_heads in (2, 1):
             check_tp_qkv_reference(rank, num_kv_heads)
         check_tp_vocabulary_reference(rank)
+        for grouped_gemm in (False, True):
+            check_tp_moe_reference(rank, grouped_gemm)
 
 
 def check_tp_qkv_reference(rank, num_kv_heads):
@@ -413,8 +424,55 @@ def check_tp_vocabulary_reference(rank):
     torch.testing.assert_close(inputs.grad, reference_inputs.grad)
 
 
+def check_tp_moe_reference(rank, grouped_gemm):
+    """Expert intermediate shards must sum outputs and upstream gradients."""
+    os.environ["VLLM_LMS_QWEN3_MOE_GROUPED_GEMM"] = (
+        "1" if grouped_gemm else "0")
+    config = tiny_config(num_hidden_layers=1)
+    block = Qwen3MoeSparseMoeBlock(config)
+    block.requires_grad_(False)
+    generator = torch.Generator(device="cpu").manual_seed(53)
+    device = torch.device(f"cuda:{rank}")
+
+    def random_tensor(*shape):
+        return torch.randn(*shape, generator=generator,
+                           device="cpu").to(device) * 0.05
+
+    intermediate = config.moe_intermediate_size
+    w13 = random_tensor(config.num_experts, 2 * intermediate,
+                        config.hidden_size)
+    w2 = random_tensor(config.num_experts, config.hidden_size, intermediate)
+    router = random_tensor(config.num_experts, config.hidden_size)
+    shard = slice(rank * intermediate // 2, (rank + 1) * intermediate // 2)
+    with torch.no_grad():
+        gate, up = w13.chunk(2, dim=1)
+        block.experts.w13_weight.copy_(torch.cat((gate[:, shard],
+                                                  up[:, shard]), dim=1))
+        block.experts.w2_weight.copy_(w2[:, :, shard])
+        block.gate.weight.copy_(router)
+
+    reference_inputs = random_tensor(7, config.hidden_size).requires_grad_()
+    inputs = reference_inputs.detach().clone().requires_grad_()
+    scores = F.linear(reference_inputs, router).softmax(-1)
+    weights, indices = scores.topk(config.num_experts_per_tok, dim=-1)
+    weights = weights / weights.sum(-1, keepdim=True)
+    routes = torch.zeros_like(scores).scatter(-1, indices, weights)
+    gate, up = torch.einsum("th,eih->tei", reference_inputs, w13).chunk(
+        2, dim=-1)
+    expert_outputs = torch.einsum("tei,ehi->teh", F.silu(gate) * up, w2)
+    expected = (expert_outputs * routes.unsqueeze(-1)).sum(1)
+    actual = block.forward_native(differentiable_identity(inputs))
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
+    probe = random_tensor(*expected.shape)
+    (actual * probe).sum().backward()
+    (expected * probe).sum().backward()
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad,
+                               atol=2e-6, rtol=2e-4)
+    assert all(parameter.grad is None for parameter in block.parameters())
+
+
 @pytest.mark.distributed_2_gpus
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Qwen3 MoE TP gradients require two CUDA GPUs")
-def test_tp_qkv_outputs_and_lora_gradients():
+def test_tp_qkv_moe_and_vocabulary_gradients():
     multi_process_parallel(2, 1, tp_qkv_worker)
