@@ -247,6 +247,11 @@ Text Generation
     - :code:`Qwen/Qwen1.5-MoE-A2.7B`, :code:`Qwen/Qwen1.5-MoE-A2.7B-Chat`, etc.
     -
     - ✅︎
+  * - :code:`Qwen3MoeForCausalLM`
+    - Qwen3MoE
+    - :code:`Qwen/Qwen3-30B-A3B`, :code:`Qwen/Qwen3-235B-A22B`, etc.
+    - Attention only
+    - ✅︎
   * - :code:`StableLmForCausalLM`
     - StableLM
     - :code:`stabilityai/stablelm-3b-4e1t`, :code:`stabilityai/stablelm-base-alpha-7b-v2`, etc.
@@ -270,6 +275,13 @@ Text Generation
 
 .. note::
     Currently, the ROCm version of vLLM supports Mistral and Mixtral only for context lengths up to 4096.
+
+.. note::
+    Qwen3MoE LoRA inference supports the attention Q/K/V and output projections.
+    LLMStation fine-tuning updates Q/K/V LoRA adapters; expert and router weights
+    remain frozen. Fine-tuning uses the layer-wise tasklet path with unquantized
+    weights and does not support pipeline parallelism. Sliding-window attention
+    is not supported.
 
 Text Embedding
 --------------

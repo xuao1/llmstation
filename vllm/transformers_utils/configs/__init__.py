@@ -16,6 +16,7 @@ from vllm.transformers_utils.configs.nemotron import NemotronConfig
 from vllm.transformers_utils.configs.nvlm_d import NVLM_D_Config
 from vllm.transformers_utils.configs.qwen2vl import (Qwen2VLConfig,
                                                      Qwen2VLVisionConfig)
+from vllm.transformers_utils.configs.qwen3_moe import Qwen3MoeConfig
 from vllm.transformers_utils.configs.solar import SolarConfig
 from vllm.transformers_utils.configs.ultravox import UltravoxConfig
 
@@ -37,4 +38,5 @@ __all__ = [
     "UltravoxConfig",
     "Qwen2VLConfig",
     "Qwen2VLVisionConfig",
+    "Qwen3MoeConfig",
 ]
