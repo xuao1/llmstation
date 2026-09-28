@@ -25,14 +25,14 @@ forward_wait=$4
 backward_tasklets=$5
 backward_wait=$6
 qwen_model=${7:-${QWEN_MODEL:-/workspace/model/Qwen3-30B-A3B}}
-gpu_ids=${GPU_IDS:-0,1,2,3}
+gpu_ids=${GPU_IDS:-0,1}
 IFS=',' read -r -a gpu_devices <<< "$gpu_ids"
 tensor_parallel_size=${#gpu_devices[@]}
 max_model_len=${MAX_MODEL_LEN:-8192}
 # Reserve GPU memory for the colocated LoRA training workload.
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.5}
 
-benchmark_duration=600
+benchmark_duration=300
 num_prompts=$(awk \
     -v rate="$request_rate" \
     -v duration="$benchmark_duration" \
